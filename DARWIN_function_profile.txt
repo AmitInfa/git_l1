@@ -1,0 +1,1732 @@
+### Name   : DARWIN_function.profile
+### Purpose: DARWIN_function.profile script defines all functions used in darwin_main_data_load.sh and darwin_restart_data_load.sh Script.
+###          and depending on the status, sends out success and failure notification.
+###			 
+###
+### Who                		 When             What
+### -----------------   	-----------      --------------------
+###  Monali Shewal  		17-Mar-2015       Initial version
+###  Monali Shewal  		07-May-2015       Added process name filter in LOAD_ID_CREATION function.
+###--------------------------------------------------------------------------
+#!/bin/bash
+. /usr/local/bin/srvinfoicspprd.profile
+. /iics_pmroot/Scripts/DARWIN/DARWIN.profile
+unset HTTPS_PROXY;
+unset HTTP_PROXY;
+unset https_proxy;
+unset http_proxy;
+
+
+function GET_WRKFLOW_TO_PROCESS
+{
+export Process_file='${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv'
+rm -f ${Process_file}
+
+crtl_result=`sqlplus -s $DBConnStr_Darwin_STG << EOF >> $LOG_FILE
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+    spool ${Process_file}
+	select WORKFLOW_NM from ${STG_SCHEMA_NM}.ETL_PROCESS_DETAIL
+	where PROCESS_NM='${PROCESS_NM}' and WORKFLOW_NM like 'tf%'
+	order by SEQ_NO;
+	Spool off;
+exit;
+EOF`
+		
+crtl_result1=$?
+
+if [[ ${crtl_result1} -ne 0 ]]
+then
+
+		echo "\SQL block to get workflow details from Process  table failed to execute. GET_WRKFLOW_TO_PROCESS function execution failed - `date`."  >> ${LOG_FILE}
+		echo "*********************************************************************** `date`" >> $LOG_FILE
+		##(echo -e " SQL block to get workflow details from ETL_PROCESS_DETAIL table failed to execute on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: SQL block to get workflow details from Process Detail table failed to execute. " $EMAIL_LIST
+		export ERROR_MSG="Execution of SQL block to get workflow details from Process Detail table failed."
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in GET_WRKFLOW_TO_PROCESS function execution" >> $LOG_FILE
+		exit 9;  # Terminating the execution of script abnormally
+     
+else 
+		echo -e "\nSQL block executed successfully to get workflow details from Process from control table - `date`." >> ${LOG_FILE}
+		
+fi
+}
+
+
+####################################################
+### function to insert the Record in control table  ###
+####################################################
+
+function INSERT_CNTRL_FILE 
+{
+
+echo "LOAD ID=${Load_ID}, SYSTEM NAME=${SYS_NAME} PROCESS NAME=${PROCESS_NM} AND WORKFLOW NAME=${wf_name} should be inserted into ETL Control table" >> ${LOG_FILE}
+
+   Result_message=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+    	set feedback off
+    	set pagesize 0
+    	set head off 
+    	set linesize 1000
+    	whenever oserror exit 9
+    	whenever sqlerror exit sql.sqlcode
+    
+       INSERT INTO ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+            VALUES (${Load_ID},
+			'$SYS_NAME',
+            '$PROCESS_NM',
+			'$wf_name',
+            sysdate,
+    		NULL,
+            'RUNNING',
+            sysdate,
+            NULL
+			);
+exit;
+EOF`
+
+INSERT_EXIT_STATE=$?
+# Handling the exception when above sql command fails to execute.  
+ if [[ ${INSERT_EXIT_STATE} -ne 0 ]]; then
+        echo -e "\nExecution of SQL block to insert record in control table failed.INSERT_CNTRL_FILE Function execution failed."  >> ${LOG_FILE}
+        echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${INSERT_EXIT_STATE} ... " >> ${LOG_FILE}
+        export ERROR_MSG="Execution of SQL block to insert record into control table failed."
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		##(echo  -e "Execution of SQL block to insert new record for LOAD ID=${Load_ID} and workflow= ${wf_name} in ETL_PROCESS_CNTRL table failed. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Execution of SQL block to insert record in control table failed. " $EMAIL_LIST
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		exit 9; # Terminating the execution of script abnormally
+ else 
+         echo -e "\n `date`: Record inserted successfully in control table for LOAD ID=${Load_ID} and workflow= ${wf_name} ." >> ${LOG_FILE}
+ fi; 
+
+}
+
+##############################################################################
+##Logic to populate the  Last_ETL_run_date 
+##extract max of END_DT_TM from Process control for the wf_name which succeded
+#################################################################################
+	
+function  get_last_run_date
+{
+
+ETL_LAST_RUN_START_DT=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+
+	ALTER SESSION SET NLS_DATE_FORMAT = 'yyyymmdd';
+    select max(START_DT_TM) from ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+    where WF_NAME like '${wf_name}%'
+	and UPPER(RUN_STATUS)='SUCCEEDED';
+  
+exit;
+EOF`
+
+get_status=$?
+if [[ ${get_status} -ne 0 ]]
+then
+        echo "\SQL block to get 'Last run date' from Control table failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${get_status} ... " >> ${LOG_FILE}
+        ##(echo "Execution of SQL block to get 'Last run date' from ETL_PROCESS_CNTRL table failed to execute for workflow= ${wf_name} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Execution of SQL block to get 'Last run date' from Control table failed to execute " $EMAIL_LIST
+		export ERROR_MSG="Execution of SQL block to get 'Last run date' from Control table failed."
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		exit 9; # Terminating the execution of script abnormally
+       
+else 
+        echo -e "\n `date`: SQL block executed successfully to get 'last run date' details from control table for workflow= ${wf_name}." >> ${LOG_FILE}
+		echo "ETL_LAST_RUN_DT= ${ETL_LAST_RUN_DT}" >> ${LOG_FILE}
+fi
+export ETL_LAST_RUN_DT=${ETL_LAST_RUN_START_DT}
+#### Calculation of last run date fro first delta load##
+if [[ -z ${ETL_LAST_RUN_START_DT} ]]; then
+
+if [[ ${wf_name} = "tf_Comet_ECC_STG_Transactions_Delta_Load"* ]]; then
+  wf_initial_name=tf_Comet_ECC_STG_Transactions_Initial_Load
+elif [[ ${wf_name} = 'tf_HEIST_ECC_STG_Transactions_Delta_Load' ]]; then
+   wf_initial_name=tf_HEIST_ECC_STG_Transactions_Initial_Load
+elif [[ ${wf_name} = 'tf_COMET_ECC_STG_Master_Load_4' ]]; then
+   wf_initial_name=tf_Comet_ECC_STG_Transactions_Initial_Load_4 
+elif [[ ${wf_name} = 'tf_RAINB_ECC_STG_Master_Load' ]]; then
+   wf_initial_name=tf_RAINB_ECC_STG_Master_Initial_Load 
+elif [[ ${wf_name} = 'tf_RAINB_ECC_STG_Master_Load_CR4' ]]; then
+   wf_initial_name=tf_RAINB_ECC_STG_Master_Initial_Load_CR4 
+fi
+echo "CHECK POINT: wf_initial_name= $wf_initial_name">> ${LOG_FILE}
+
+ETL_LAST_RUN_START_DT=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+
+	ALTER SESSION SET NLS_DATE_FORMAT = 'yyyymmdd';
+    select max(START_DT_TM) from ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+    where WF_NAME='${wf_initial_name}'  
+	and UPPER(RUN_STATUS)='SUCCEEDED';
+  
+exit;
+EOF`
+
+get_status1=$?
+	if [[ ${get_status1} -ne 0 ]]
+	then
+		echo "\SQL block to get Last run date  from Control table for first transaction delta load failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "\SQL block to get 'Last run date' from Control table for first transaction delta load failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${get_status1} ... " >> ${LOG_FILE}
+        ##(echo "Execution of SQL block to get 'Last run date' from Control table failed to execute for wf_Comet_ECC_STG_Transactions_Initial_Load workflow from ETL_PROCESS_CNTRL table on `date`. \n Please refer Logfile present at link: $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Execution of SQL block to get 'Last run date' for first transaction delta load from Control table failed to execute " $EMAIL_LIST
+		export ERROR_MSG="Execution of SQL block to get 'Last run date' for first transaction delta load from Control Table failed."
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		exit 9; # Terminating the execution of script abnormally		
+	else 
+		echo -e "\n `date`: SQL block executed successfully to get last run date details for first transaction delta load from control table." >> ${LOG_FILE}
+			
+	fi
+	export ETL_LAST_RUN_DT=${ETL_LAST_RUN_START_DT}
+fi
+
+}
+
+#####################################################
+## Start creating dynamic parameter file
+#####################################################
+function Darwin_param_creation
+{
+echo "Parameter file creation started" >> ${LOG_FILE}
+echo "Load_ID=${Load_ID}" >> ${LOG_FILE}
+if [[ -f $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ]];then
+echo "##############################################################" >> ${LOG_FILE} 
+echo "Starting execution of script to generate parameter file: Darwin_${wf_name}_prm.sh." >> ${LOG_FILE}
+. $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ${Load_ID}
+param_file_status=$?
+echo param_file_status=$param_file_status >> ${LOG_FILE}
+    	if [[ $param_file_status -eq 0 ]] ; then
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date '+%m-%d-%Y %H:%M:%S'`: Parameter File is created " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    	else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date` : Error in creating parameter file " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e "Error in creation parameter file for ${wf_name} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to errors in creation of parameter file." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to errors in creation of parameter file for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+    	fi;
+else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date` : Script for Parameter file generation is not present at $SCRIPT_DIR: Darwin_${wf_name}_prm.sh " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e " `date`: \n Kindly check if $SCRIPT_DIR/Darwin_${wf_name}_prm.sh script is available. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to unavailability of parameter file generation script." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to unavailability of parameter file generation script for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+fi
+}
+
+
+function Darwin_stage_delta_param
+{
+echo "Parameter file creation started" >> ${LOG_FILE}
+echo "LOAD ID =${Load_ID}" >> ${LOG_FILE}
+echo "ETL_LAST_RUN_DT =${ETL_LAST_RUN_DT}" >> ${LOG_FILE}
+echo "VBAK_MIN =${VBAK_MIN}" >> ${LOG_FILE}
+echo "LIKP_MIN =${LIKP_MIN}" >> ${LOG_FILE}
+echo "EKKO_MIN =${EKKO_MIN}" >> ${LOG_FILE}
+echo "LIKP_MIN_2 =${LIKP_MIN_2}" >> ${LOG_FILE}
+
+
+#. $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ${Load_ID} ${ETL_LAST_RUN_DT} ${VBAK_MIN} ${VBAK_MAX} ${LIKP_MIN} ${LIKP_MAX} ${EKKO_MIN} ${EKKO_MAX} ${LIKP_MIN_2} ${LIKP_MAX_2} 
+if [[ -f $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ]];then
+echo "##############################################################" >> ${LOG_FILE} 
+echo "Starting execution of script to generate parameter file: Darwin_${wf_name}_prm.sh." >> ${LOG_FILE}
+
+. $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ${Load_ID} ${ETL_LAST_RUN_DT} ${VBAK_MIN} ${LIKP_MIN} ${LIKP_MIN_2}
+
+param_file_status=$?
+echo param_file_status=$param_file_status >> ${LOG_FILE}
+    	if [[ $param_file_status -eq 0 ]] ; then
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date '+%m-%d-%Y %H:%M:%S'`: Parameter File is created " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    	else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date`: Error in creating parameter file " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e "Error in creation parameter file for ${wf_name} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to errors in creation of parameter file." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to errors in creation of parameter file for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+    	fi;
+else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date` : Script for Parameter file generation is not present at $SCRIPT_DIR: Darwin_${wf_name}_prm.sh " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e " `date`: \n Kindly check if $SCRIPT_DIR/Darwin_${wf_name}_prm.sh script is available. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to unavailability of parameter file generation script." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to unavailability of parameter file generation script for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+fi
+}
+
+
+function Darwin_lastrundt_param
+{
+echo "Parameter file creation started" >> ${LOG_FILE}
+echo "LOAD ID =${Load_ID}" >> ${LOG_FILE}
+echo "ETL_LAST_RUN_DT =${ETL_LAST_RUN_DT}" >> ${LOG_FILE}
+if [[ -f $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ]];then
+echo "##############################################################" >> ${LOG_FILE} 
+echo "Starting execution of script to generate parameter file: Darwin_${wf_name}_prm.sh." >> ${LOG_FILE}
+
+. $SCRIPT_DIR/Darwin_${wf_name}_prm.sh ${Load_ID} ${ETL_LAST_RUN_DT}  
+param_file_status=$?
+echo param_file_status=$param_file_status >> ${LOG_FILE}
+    	if [[ $param_file_status -eq 0 ]] ; then
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date '+%m-%d-%Y %H:%M:%S'`: Parameter File is created " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    	else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date`: Error in creating parameter file " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e "Error in creation parameter file for ${wf_name} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to errors in creation of parameter file." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to errors in creation of parameter file for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+    	fi;
+else
+    		echo "##############################################################" >> ${LOG_FILE}
+    		echo "## `date` : Script for Parameter file generation is not present at $SCRIPT_DIR: Darwin_${wf_name}_prm.sh " >> ${LOG_FILE}
+    		echo "##############################################################" >> ${LOG_FILE}
+    		##(echo -e " `date`: \n Kindly check if $SCRIPT_DIR/Darwin_${wf_name}_prm.sh script is available. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Failed due to unavailability of parameter file generation script." $EMAIL_LIST
+    		export ERROR_MSG="Failed due to unavailability of parameter file generation script for workflow- ${wf_name}."
+			echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+			END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+			echo "END_TM=$END_TM" >> $LOG_FILE
+			FAIL_MAIL_NOTIFICATION
+			rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+			rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    		echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in creating parameter file" >> $LOG_FILE
+    		echo "##############################################################" >> $LOG_FILE
+    		exit 9;  # Terminating the execution of script abnormally
+fi
+}
+#######################################
+#####################################################
+#Function to start the Informatica workflow
+#####################################################
+ 
+function run_informatica_wf
+{
+wf_staus=0;
+export WF_Start_Time=`date +%Y_%m_%d_%I_%M_%P`
+
+        if [[ $wf_name = "wf_COMET_APO_ZGSCM_BAPI_CAPLOAD" ]] && [[ ${SYS_NAME} = "RR2_FILE" ]] ; then
+        INFA_FOLDER="Darwin_PROD"
+		echo "Folder set to $INFA_FOLDER in function run_informatica_wf"  >> $LOG_FILE
+        fi;
+		
+		export INFA_WRKFLOW=${wf_name}
+		################################################################################
+    	#Following block runs Informatica work flow.
+    	##################################################################################
+    	##################################################################################
+    	
+		echo "Workflow execution $wf_name is in progress .....`date`" >>  $LOG_FILE
+    	#$PM_HOME/pmcmd startworkflow -sv $INFA_SERVICE -d $INFA_DOMAIN -u $INFA_USER -p $INFA_PSWD -f $INFA_FOLDER -paramfile $paramfile -wait $wf_name >> $LOG_FILE
+        scriptPath=${0}
+		taskName=$wf_name
+scriptName=$(basename "$scriptPath")
+scriptName="${scriptName%.*}"
+icUser=iics_darwin@merck.bk.prod.com
+icPwd=**********
+icHdr1="Accept: application/xml";
+icHdr2="Content-Type:  application/xml";
+file_icResponse_xml=${LOG_DIR}/icsresponse_xml_${taskName}.xml
+file_icResponse_json=${LOG_DIR}/icsresponse_json_${taskName}.json
+file_logFile=${LOG_DIR}/icslogfile_${taskName}.xml
+chmod 777 $file_logFile
+icLoginUrl=https://dm-us.informaticacloud.com/ma/api/v2;
+icServerUrl=${icLoginUrl};
+alias timeStamp="date '+%T'";
+###taskName=$wf_name
+function ic_parseXml(){
+ 
+    if  ! [ "$1" ] || ! [ "$2" ]; then
+        echo "usage: $me <XML file> <XML tag>"
+    elif ! [ -f $1 ]; then
+        echo "Error: $1 not found!"
+    else
+       cat $1 | grep -oP "(?<=<$2>)[^<]+"
+    fi
+}
+ 
+function aux_logMe(){
+	echo -e "${1}" 2>&1 | tee -a ${file_logFile};
+}
+ 
+function ic_login(){
+ 
+    curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -k -X POST -o ${file_icResponse_xml} -d "<login> <username>${icUser}</username> <password>${icPwd}</password></login>" "${icLoginUrl}/user/login" > /dev/null;
+          chmod 777 $file_icResponse_xml
+	  chmod 777 $file_logFile
+	  icSessId="$(ic_parseXml ${file_icResponse_xml} icSessionId)";
+          icServerUrl="$(ic_parseXml ${file_icResponse_xml} serverUrl)";
+		  	echo "file read starts here"
+			cat ${file_icResponse_xml};
+			echo "file read ends here"
+   }
+ 
+ 
+function ic_startTaskFlow(){
+curl -v -s -0 -H 'Accept: application/xml' -H 'Content-Type:  application/xml' -H "IDS-SESSION-ID: ${icSessId}" -k -X POST -o ${file_icResponse_xml} https://na2.dm-us.informaticacloud.com/active-bpel/rt/${taskName}
+	chmod 777 $file_icResponse_xml	
+        errCd="$(ic_parseXml ${file_icResponse_xml} code)";
+ 
+        if [ -z ${errCd} ]; then
+ 
+                #retrieve the task id and run id from taskXml
+			echo "file read starts here"
+			cat ${file_icResponse_xml};
+			echo "file read ends here"
+                tfrId="$(ic_parseXml ${file_icResponse_xml} RunId)";
+		aux_logMe "${timeStamp}: ${taskName} started successfully" 
+                aux_logMe "${timeStamp}: tfrId : $tfrId"
+		else
+			aux_logMe "${timeStamp}: Identified issues with triggering ${taskName}"
+			aux_logMe "${timeStamp}: Issue  $(ic_parseXml ${file_icResponse_xml} description)"
+			aux_logMe "${timeStamp}: Exiting script"
+			aux_logMe "------------------------------------------------------------"			
+			ic_logout > /dev/null;
+			wf_staus=1;
+			###exit 1			
+        fi    
+
+}
+ 
+function ic_activity_monitor(){
+state=;
+status="RUNNING";
+i=0;
+####while [ ${status} == "RUNNING" ]
+while [ "${status}" == "RUNNING" ] || [ "${status}" == "No status available" ]
+do
+        curl -s -0 -H "Accept: application/json" -H "IDS-SESSION-ID: ${icSessId}" -k -X GET -o ${file_icResponse_json} "https://na2.dm-us.informaticacloud.com/active-bpel/services/tf/status/${tfrId}" > /dev/null;
+	   chmod 777 $file_icResponse_json	
+	   echo "in while loop"
+		i=i+1;
+		echo "value of i is $i"
+		sleep 50
+		status=$(grep -o '"status": *"[^"]*"' $file_icResponse_json | cut -d'"' -f4 | head -1)
+		echo "Value of status is ${status}";
+		echo "${timeStamp}: waiting for ${taskName} to complete, sleep for 50 seconds"
+		rm $file_icResponse_json 
+done
+		        if [ "${status}" == "SUCCESS" ];then
+			aux_logMe "${timeStamp}: ${taskName} exit state is ${status}" 
+			aux_logMe "${timeStamp}: ${taskName} is completed";
+			else
+			aux_logMe "${timeStamp}: ${taskName} exit status is ${status}" 
+            aux_logMe "${timeStamp}: Issues detected with task ${taskName}, hence exiting from script";
+			aux_logMe "---------"
+            ic_logout;
+			wf_staus=1;
+			###exit 1
+           fi
+}
+function ic_logout(){
+        curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -H "icSessionId: ${icSessId}" -k -X POST "${icServerUrl}/api/v2/user/logout" 2>&1
+}
+ 
+ 
+ic_login
+ic_startTaskFlow
+ic_activity_monitor
+ic_logout
+
+###wf_staus=$?
+		#wf_staus=0		
+
+if [ ${SYS_NAME} = "RR2_FILE" ]; then
+${SCRIPT_DIR}/WF_RUN_LOGS/WF_RUN_LOG_CREATION.sh "${WF_Start_Time}" "${INFA_WRKFLOW}" "${SYS_NAME}" &
+fi
+
+    	echo "Workflow execution $wf_name complete : STATUS : $wf_staus `date`" >> $LOG_FILE
+    	##################################################################################
+    	
+    	if [[ wf_staus -eq 0 ]] ; then
+    		echo " $wf_name  WORKFLOW Succeeded,`date`" >> $LOG_FILE
+    		export RUN_STATUS="SUCCEEDED";
+			
+    	    UPDATE_CNTRL_TBL_RUNNING   >> $LOG_FILE
+			update_status1=$?
+    
+			if [[ ${update_status1} -ne 0 ]]; then
+				echo "\SQL block to  upadte record count from control table failed to execute. UPDATE_CNTRL_TBL_RUNNING Function execution failed."  >> ${LOG_FILE}
+				echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${update_status1} ... " >> ${LOG_FILE}
+				##(echo -e "DARWIN Load Process: SQL block to update record in control table failed to execute for ${wf_name} on `date`.\n UPDATE_CNTRL_TBL_RUNNING Function execution failed. \n Please refer Logfile present at link: $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: SQL block to update record in control table failed to execute." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to update status of workflow in control table failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to update record in control table failed to execute" >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+					
+			else 
+				echo -e "\nSQL block executed successfully to update record in control table for ${wf_name}." >> ${LOG_FILE}
+			fi
+			
+		else
+    		echo  " $wf_name WORKFLOW Load Failed,`date`" >> $LOG_FILE
+    		export RUN_STATUS="FAILED";
+			UPDATE_CNTRL_TBL_RUNNING   >> $LOG_FILE
+			
+			if [[ ${wf_name} = *"STG"* || ${wf_name} = *"Stage"* ]]; then
+			
+						 echo "-----------------------Recovery Process Start--------------------" >> $LOG_FILE
+						 rm -f ${rfc_fail_wf} ${non_rfc_fail_wf} ${rfc_fail_session}
+						 touch ${rfc_fail_wf} ${non_rfc_fail_wf} ${rfc_fail_session}
+						 echo -e "\n calling get_fail_rfc_wrkflow_list function" >> $LOG_FILE
+						 get_fail_rfc_wrkflow_list
+						 echo -e "\n end of get_fail_rfc_wrkflow_list function" >> $LOG_FILE
+						 
+						 echo -e "\n calling get_fail_non_rfc_wrkflow_list function" >> $LOG_FILE
+						 get_fail_non_rfc_wrkflow_list
+						 echo -e "\n end of get_fail_non_rfc_wrkflow_list function" >> $LOG_FILE
+						 
+						if [[ -s ${non_reover_fail_session} ]] || [[ -s ${rfc_fail_wf} ]] ; then
+							 echo -e "${non_reover_fail_session} or ${rfc_fail_wf} has data." >> $LOG_FILE
+						
+							 echo -e "\n start of check_non_rfc_failed_session function" >> $LOG_FILE
+							 check_non_rfc_failed_session
+							 echo -e "\n end of check_non_rfc_failed_session function" >> $LOG_FILE
+							 
+							 echo -e "\n start of get_failed_session function" >> $LOG_FILE
+							 get_failed_session
+							 echo -e "\n end of get_failed_session function" >> $LOG_FILE
+							 
+							 echo -e "\n start of run_failed_session function" >> $LOG_FILE
+							 run_failed_session
+							 echo -e "\n end of run_failed_session function" >> $LOG_FILE
+							 echo "-----------------------Recovery Process End--------------------" >> $LOG_FILE
+						else
+							export ERROR_MSG="RFC_Recovery Process:$INFA_WRKFLOW not executed - No entry found in metadata table."
+							echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+							END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+							echo "END_TM=$END_TM" >> $LOG_FILE
+							FAIL_MAIL_NOTIFICATION
+							rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+							rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+							echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to update record in control table failed to execute" >> $LOG_FILE
+							exit 9; # Terminating the execution of script abnormally
+						fi ;
+			else
+					workflow_failure_mail
+			fi;
+    		echo "##############################################################" >> $LOG_FILE
+    	fi;
+	# if [[ ${wf_name} = 'wf_HEIST_PUB_To_File_Load_Daily' && ${SYS_NAME} = 'RR2_FILE' ]]; then
+	# #	/opt/expect/bin/expect ${SCRIPT_DIR}/sftp_partsource_files.sh $partsource_path $kinaxis_path $kinaxis_port $kinaxis_user $kinaxis_server $kinaxis_pass
+		# sftp_STATUS=$?	
+		# if [[ ${sftp_STATUS} -ne 0 ]]
+		# then
+				# echo -e "\n Error in purging process."  >> ${LOG_FILE}
+				# echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${sftp_STATUS} ... " >> ${LOG_FILE}
+				# (echo "DARWIN Load Process: Error in coping PartSourceHeist File from $partsource_path to $kinaxis_path Directory on $kinaxis_server server via SFTP protocol on `date`. ") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Error in PartSourceHeist SFTP process. " $EMAIL_LIST
+				# exit -1; # Terminating the execution of script abnormally
+		# else 
+				# echo "Coping PartSourceHeist File from $partsource_path to $kinaxis_path Directory on $kinaxis_server server via SFTP protocol completed successfully on `date`." >> ${LOG_FILE}
+		# fi
+	# fi	
+	
+	if [[ ${wf_name} = 'tf_DARWIN_PUB_To_File_Load_Daily' ]] || [[ ${wf_name} = 'tf_DARWIN_PUB_TO_FILE_LOAD_ONE_TIME_LOAD' ]] || [[ ${wf_name} = 'tf_DARWIN_PUB_To_File_Load_Yearly' ]] || [[ ${wf_name} = 'tf_HEIST_PUB_To_File_Load_Daily' ]] || [[ ${wf_name} = 'tf_HEIST_PUB_To_File_Load_Yearly' ]]; then
+	nohup ${SCRIPT_DIR}/darwin_success_mail.sh ${wf_name} &
+	echo "## `date '+%m-%d-%Y %H:%M:%S'`: darwin_success_mail.sh script executed for workflow- ${wf_name} ##" >> ${LOG_FILE}
+	fi
+
+	
+}
+
+####################################################
+
+function UPDATE_CNTRL_TBL_RUNNING  
+{
+
+    	if [[ $RUN_STATUS = "FAILED"  ||  $RUN_STATUS = "SUCCEEDED" ]]; 
+    	then
+    	`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+    	set feedback off
+    	set pagesize 0
+    	set head off 
+    	set linesize 1000
+    	whenever oserror exit 9
+    	whenever sqlerror exit sql.sqlcode
+    
+    	UPDATE ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL 
+    	SET RUN_STATUS='$RUN_STATUS', 
+    	END_DT_TM=SYSDATE ,
+    	LAST_UPDT_DT_TM=SYSDATE
+    	WHERE  RUN_STATUS='RUNNING' 
+		and LOAD_ID=${Load_ID}
+		and WF_NAME='${wf_name}';
+     	COMMIT ;
+exit;
+EOF`
+fi
+		
+# if [[ $RUN_STATUS = "FAILED" ]]; then
+    # echo -e "\n ##${wf_name} WORKFLOW execution failed.###"  >> ${LOG_FILE}
+    # echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status $RUN_STATUS ... " >> ${LOG_FILE}
+    # ##(echo -e "DARWIN Load Process:${wf_name} WORKFLOW execution failed for LOAD ID= ${LOAD_ID} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: ${wf_name} WORKFLOW execution failed for LOAD ID= ${LOAD_ID}." $EMAIL_LIST
+	# export ERROR_MSG="${wf_name} Workflow execution failed."
+	# echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+	# END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+	# echo "END_TM=$END_TM" >> $LOG_FILE
+	# FAIL_MAIL_NOTIFICATION
+	# rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+	# rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    # echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of ${wf_name} WORKFLOW" >> $LOG_FILE
+    # exit 9; # Terminating the execution of script abnormally
+# fi
+}
+  
+function run_informatica_restart_wf
+{
+
+        if [[ $wf_name = "tf_COMET_APO_ZGSCM_BAPI_CAPLOAD" ]] && [[ ${SYS_NAME} = "RR2_FILE" ]] ; then
+        INFA_FOLDER="DARWIN/DARWIN_PWC"
+		echo "Folder set to $INFA_FOLDER in function run_informatica_restart_wf"  >> $LOG_FILE
+        fi;
+		
+		export INFA_WRKFLOW=${wf_name}
+		################################################################################
+    	#Following block runs Informatica work flow.
+    	##################################################################################
+    	##################################################################################
+    	
+		echo "Workflow execution $wf_name is in progress .....`date`" >>  $LOG_FILE
+    	#$PM_HOME/pmcmd startworkflow -sv $INFA_SERVICE -d $INFA_DOMAIN -u $INFA_USER -p $INFA_PSWD -f $INFA_FOLDER -paramfile $paramfile -wait $wf_name >> $LOG_FILE
+        scriptPath=${0}
+scriptName=$(basename "$scriptPath")
+scriptName="${scriptName%.*}"
+taskName=$wf_name
+icUser=iics_darwin@merck.bk.prod.com
+icPwd=*********
+icHdr1="Accept: application/xml";
+icHdr2="Content-Type:  application/xml";
+file_icResponse_xml=${LOG_DIR}/icsresponse_xml_${taskName}.xml
+file_icResponse_json=${LOG_DIR}/icsresponse_json_${taskName}.json
+file_logFile=${LOG_DIR}/icslogfile_${taskName}.xml
+chmod 777 $file_logFile
+icLoginUrl=https://dm-us.informaticacloud.com/ma/api/v2;
+icServerUrl=${icLoginUrl};
+alias timeStamp="date '+%T'";
+
+function ic_parseXml(){
+ 
+    if  ! [ "$1" ] || ! [ "$2" ]; then
+        echo "usage: $me <XML file> <XML tag>"
+    elif ! [ -f $1 ]; then
+        echo "Error: $1 not found!"
+    else
+       cat $1 | grep -oP "(?<=<$2>)[^<]+"
+    fi
+}
+ 
+function aux_logMe(){
+	echo -e "${1}" 2>&1 | tee -a ${file_logFile};
+}
+ 
+function ic_login(){
+ 
+    curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -k -X POST -o ${file_icResponse_xml} -d "<login> <username>${icUser}</username> <password>${icPwd}</password></login>" "${icLoginUrl}/user/login" > /dev/null;
+          chmod 777 $file_icResponse_xml
+	  chmod 777 $file_logFile
+	  icSessId="$(ic_parseXml ${file_icResponse_xml} icSessionId)";
+          icServerUrl="$(ic_parseXml ${file_icResponse_xml} serverUrl)";
+		  	echo "file read starts here"
+			cat ${file_icResponse_xml};
+			echo "file read ends here"
+   }
+ 
+ 
+function ic_startTaskFlow(){
+curl -s -0 -H 'Accept: application/xml' -H 'Content-Type:  application/xml' -H "IDS-SESSION-ID: ${icSessId}" -k -X POST -o ${file_icResponse_xml} https://na2.dm-us.informaticacloud.com/active-bpel/rt/${taskName}
+	chmod 777 $file_icResponse_xml	
+        errCd="$(ic_parseXml ${file_icResponse_xml} code)";
+ 
+        if [ -z ${errCd} ]; then
+ 
+                #retrieve the task id and run id from taskXml
+			echo "file read starts here"
+			cat ${file_icResponse_xml};
+			echo "file read ends here"
+                tfrId="$(ic_parseXml ${file_icResponse_xml} RunId)";
+		aux_logMe "${timeStamp}: ${taskName} started successfully" 
+                aux_logMe "${timeStamp}: tfrId : $tfrId"
+		else
+			aux_logMe "${timeStamp}: Identified issues with triggering ${taskName}"
+			aux_logMe "${timeStamp}: Issue  $(ic_parseXml ${file_icResponse_xml} description)"
+			aux_logMe "${timeStamp}: Exiting script"
+			aux_logMe "------------------------------------------------------------"			
+			ic_logout > /dev/null;
+			exit 1			
+        fi    
+
+}
+ 
+function ic_activity_monitor(){
+state=;
+status="RUNNING";
+i=0;
+####while [ ${status} == "RUNNING" ]
+while [ "${status}" == "RUNNING" ] || [ "${status}" == "No status available" ]																			  
+do
+        curl -s -0 -H "Accept: application/json" -H "IDS-SESSION-ID: ${icSessId}" -k -X GET -o ${file_icResponse_json} "https://na2.dm-us.informaticacloud.com/active-bpel/services/tf/status/${tfrId}" > /dev/null;
+	   chmod 777 $file_icResponse_json	
+	   echo "in while loop"
+		i=i+1;
+		echo "value of i is $i"
+		sleep 50
+		status=$(grep -o '"status": *"[^"]*"' $file_icResponse_json | cut -d'"' -f4 | head -1)
+		echo "Value of status is ${status}";
+		echo "${timeStamp}: waiting for ${taskName} to complete, sleep for 50 seconds"
+		rm $file_icResponse_json 
+done
+		        if [ "${status}" == "SUCCESS" ];then
+			aux_logMe "${timeStamp}: ${taskName} exit state is ${status}" 
+			aux_logMe "${timeStamp}: ${taskName} is completed";
+			else
+			aux_logMe "${timeStamp}: ${taskName} exit status is ${status}" 
+            aux_logMe "${timeStamp}: Issues detected with task ${taskName}, hence exiting from script";
+			aux_logMe "---------"
+            ic_logout;
+			exit 1
+           fi
+}
+function ic_logout(){
+        curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -H "icSessionId: ${icSessId}" -k -X POST "${icServerUrl}/api/v2/user/logout" 2>&1
+}
+ 
+ 
+ic_login
+ic_startTaskFlow
+ic_activity_monitor
+ic_logout
+
+    	wf_staus=$?
+		#wf_staus=0 		
+    	echo "Workflow execution $wf_name complete : STATUS : $wf_staus `date`" >> $LOG_FILE
+    	##################################################################################
+    	
+    	if [[ wf_staus -eq 0 ]] ; then
+    		echo " $wf_name  WORKFLOW Succeeded,`date`" >> $LOG_FILE
+    		export RUN_STATUS="SUCCEEDED";
+    	
+			UPDATE_CNTRL_TBL_FAILED   >> $LOG_FILE
+			update_status1=$?
+    
+			if [[ ${update_status1} -ne 0 ]]; then
+				echo "\SQL block to  upadte record count from control table failed to execute. UPDATE_CNTRL_TBL_FAILED Function execution failed."  >> ${LOG_FILE}
+				echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${update_status1} ... " >> ${LOG_FILE}
+				##(echo -e "DARWIN Load Process: SQL block to update record in control table failed to execute for ${wf_name} on `date`.\n UPDATE_CNTRL_TBL_FAILED Function execution failed. \n Please refer Logfile present at link: $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: SQL block to update record in control table failed to execute." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to update status of workflow in control table failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to update record in control table failed to execute" >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+					
+			else 
+				echo -e "\nSQL block executed successfully to update record in control table for ${wf_name}." >> ${LOG_FILE}
+			fi
+			
+		else
+    		echo  " $wf_name WORKFLOW Load Failed,`date`" >> $LOG_FILE
+    		export RUN_STATUS="FAILED";
+			
+			UPDATE_CNTRL_TBL_FAILED   >> $LOG_FILE
+			if [[ ${wf_name} = *"STG"* || ${wf_name} = *"Stage"* ]]; then
+					echo "-----------------------Recovery Process Start--------------------" >> $LOG_FILE
+					rm -f ${rfc_fail_wf} ${non_rfc_fail_wf} ${rfc_fail_session}
+					touch ${rfc_fail_wf} ${non_rfc_fail_wf} ${rfc_fail_session}
+					echo -e "\n calling get_fail_rfc_wrkflow_list function" >> $LOG_FILE
+						 get_fail_rfc_wrkflow_list
+						 echo -e "\n end of get_fail_rfc_wrkflow_list function" >> $LOG_FILE
+						 						 
+						 echo -e "\n calling get_fail_non_rfc_wrkflow_list function" >> $LOG_FILE
+						 get_fail_non_rfc_wrkflow_list
+						 echo -e "\n end of get_fail_non_rfc_wrkflow_list function" >> $LOG_FILE
+						 
+						if [[ -s ${non_reover_fail_session} ]] || [[ -s ${rfc_fail_wf} ]] ; then
+							 echo -e "${non_reover_fail_session} or ${rfc_fail_wf} has data." >> $LOG_FILE
+						     
+							 echo -e "\n start of check_non_rfc_failed_session function" >> $LOG_FILE
+							 check_non_rfc_failed_session
+							 echo -e "\n end of check_non_rfc_failed_session function" >> $LOG_FILE
+							 
+							 echo -e "\n start of get_failed_session function" >> $LOG_FILE
+							 get_failed_session
+							 echo -e "\n end of get_failed_session function" >> $LOG_FILE
+							 
+							 echo -e "\n start of run_failed_session function" >> $LOG_FILE
+							 run_failed_session
+							 echo -e "\n end of run_failed_session function" >> $LOG_FILE
+							 echo "-----------------------Recovery Process End--------------------" >> $LOG_FILE
+						else
+							(echo "No Details found for failed sessions in $INFA_WRKFLOW on `date`.") | mailx -a ${non_reover_fail_session} -s "DARWIN-${PROCESS_NM}@${env}:$INFA_WRKFLOW not executed " $EMAIL_LIST
+							rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+							exit 9;
+						fi ;
+					
+					
+			else
+					workflow_failure_mail
+			fi;
+    		echo "##############################################################" >> $LOG_FILE
+    	fi;
+	
+#	if [[ ${wf_name} = 'wf_HEIST_PUB_To_File_Load_Daily' && ${SYS_NAME} = 'RR2_FILE' ]]; then
+	#	/opt/expect/bin/expect ${SCRIPT_DIR}/sftp_partsource_files.sh $partsource_path $kinaxis_path $kinaxis_port $kinaxis_user $kinaxis_server $kinaxis_pass
+	#	sftp_STATUS=$?	
+	#	if [[ ${sftp_STATUS} -ne 0 ]]
+	#	then
+	#			echo -e "\n Error in purging process."  >> ${LOG_FILE}
+	#			echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${sftp_STATUS} ... " >> ${LOG_FILE}
+	#			(echo "DARWIN Load Process: Error in coping PartSourceHeist File from $partsource_path to $kinaxis_path Directory on $kinaxis_server server via SFTP protocol on `date`. ") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Error in PartSourceHeist SFTP process. " $EMAIL_LIST
+	#			exit -1; # Terminating the execution of script abnormally
+	#	else 
+	#			echo "Coping PartSourceHeist File from $partsource_path to $kinaxis_path Directory on $kinaxis_server server via SFTP protocol completed successfully on `date`." >> ${LOG_FILE}
+	#	fi
+#	fi	
+	
+	if [[ ${wf_name} = 'tf_DARWIN_PUB_To_File_Load_Daily' ]] || [[ ${wf_name} = 'tf_DARWIN_PUB_To_File_Load_One_Time_Load' ]] || [[ ${wf_name} = 'tf_DARWIN_PUB_To_File_Load_Yearly' ]] || [[ ${wf_name} = 'wf_HEIST_PUB_To_File_Load_Daily' ]] || [[ ${wf_name} = 'wf_HEIST_PUB_To_File_Load_Yearly' ]]; then
+	. ${SCRIPT_DIR}/darwin_success_mail.sh ${wf_name} &
+	echo "## `date '+%m-%d-%Y %H:%M:%S'`: darwin_success_mail.sh script executed for workflow- ${wf_name} ##" >> ${LOG_FILE}
+	fi	
+    
+}
+ 
+ function workflow_failure_mail
+ {
+ 				if [[ $RUN_STATUS = "FAILED" ]]; then
+					echo -e "\n ##${wf_name} WORKFLOW execution failed.###"  >> ${LOG_FILE}
+					echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status $RUN_STATUS ... " >> ${LOG_FILE}
+					export ERROR_MSG="${wf_name} Workflow execution failed."
+					echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+					END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+					echo "END_TM=$END_TM" >> $LOG_FILE
+					FAIL_MAIL_NOTIFICATION
+					rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+					rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+					echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of ${wf_name} WORKFLOW" >> $LOG_FILE
+					exit 9; # Terminating the execution of script abnormally
+				fi
+ }
+ 
+function UPDATE_CNTRL_TBL_FAILED  
+{
+
+if [[ $RUN_STATUS = "FAILED"  ||  $RUN_STATUS = "SUCCEEDED" ]]; 
+then
+    	`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+    	set feedback off
+    	set pagesize 0
+    	set head off 
+    	set linesize 1000
+    	whenever oserror exit 9
+    	whenever sqlerror exit sql.sqlcode
+    
+    	UPDATE ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL 
+    	SET RUN_STATUS='$RUN_STATUS', 
+    	END_DT_TM=SYSDATE ,
+    	LAST_UPDT_DT_TM=SYSDATE
+    	WHERE (RUN_STATUS='FAILED' or RUN_STATUS='RUNNING')
+		and LOAD_ID=${Load_ID}
+		and WF_NAME='${wf_name}';
+     	COMMIT ;
+exit;
+EOF`
+fi
+		
+# if [[ $RUN_STATUS = "FAILED" ]]; then
+    # echo -e "\n ###${wf_name} WORKFLOW execution failed.###"  >> ${LOG_FILE}
+    # echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status $RUN_STATUS ... " >> ${LOG_FILE}
+   # #(echo -e "DARWIN Load Process:${wf_name} WORKFLOW execution failed for LOAD ID= ${LOAD_ID} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: ${wf_name} WORKFLOW execution failed for LOAD ID= ${LOAD_ID}." $EMAIL_LIST
+	# export ERROR_MSG="${wf_name} Workflow execution failed."
+	# echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+	# END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+	# echo "END_TM=$END_TM" >> $LOG_FILE
+	# FAIL_MAIL_NOTIFICATION
+	# rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+	# rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+    # echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of ${wf_name} WORKFLOW" >> $LOG_FILE
+    # exit 9; # Terminating the execution of script abnormally
+# fi
+}
+ 
+ 
+function FAILED_WF_COUNT
+{
+	################################
+RUN_ID=`sqlplus -s $DBConnStr_Darwin_STG <<EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+	SELECT count(*) FROM DARWIN_STG.ETL_PROCESS_CNTRL
+	WHERE  RUN_STATUS='FAILED' 
+	and LOAD_ID=${Load_ID}
+	and WF_NAME='${wf_name}';
+exit;
+EOF`
+
+RUN_COUNT_EXIT_CD1=$?
+
+if [[ ${RUN_COUNT_EXIT_CD1} -ne 0 ]];then
+	            echo "\SQL block to get count of workflows from control table for LOAD ID=${Load_ID} and workflow=${wf_name} failed to execute."  >> ${LOG_FILE}
+                echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${RUN_COUNT_EXIT_CD1} ... " >> ${LOG_FILE}
+				#(echo "DARWIN Load Process:SQL block to get count of workflows from control table for LOAD ID=${Load_ID} and workflow=${wf_name} failed to execute on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: SQL block to get count of workflows from control table failed." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to get count of workflows from control table failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to get count of workflows from control table for LOAD ID=${Load_ID} and workflow=${wf_name} failed to execute" >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+				
+else 
+                echo -e "\nSQL block executed successfully to get record count from control table for LOAD ID=${Load_ID} and workflow=${wf_name}." >> ${LOG_FILE}
+				echo " Control table has entry of ${RUN_ID} ${wf_name} status as 'FAILED'." >> ${LOG_FILE}
+fi
+}
+
+function LOAD_ID_CREATION
+{
+LOAD_ID=`sqlplus -s $DBConnStr_Darwin_STG <<EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+	SELECT COALESCE (MAX(LOAD_ID), 0)+1 MAX_LOAD_ID FROM DARWIN_STG.ETL_PROCESS_CNTRL
+	where SYS_NM='${SYS_NAME}'
+	and LOAD_PROCESS_NM IN ('${PROCESS_NM}',decode('${SYS_NAME}','COMET_ECC','ECC_INITIAL_E2E','COMET_ECC','ECC_INITIAL_4','HEIST_ECC','HEIST_INITIAL_E2E','RAINB_ECC','RAINB_ECC_INTIAL_CR4'));
+	
+exit;
+EOF`
+
+RUN_COUNT_EXIT_CD=$?
+export Load_ID=$LOAD_ID
+echo "Generated Load_ID is ${LOAD_ID}" >> $LOG_FILE
+
+if [[ ${RUN_COUNT_EXIT_CD} -ne 0 ]]
+then
+                echo "\SQL block to Generated Load_ID is failed to execute. LOAD_ID_CREATION function execution failed."  >> ${LOG_FILE}
+                echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${RUN_COUNT_EXIT_CD} ... " >> ${LOG_FILE}
+                ##(echo "DARWIN Load Process:SQL block to get record count from control table failed to execute on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: SQL block to get record count from control table failed to execute." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to generate Load_ID is failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to generate load_id." >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+				
+else 
+                echo -e "\nSQL block executed successfully to get record count from control table." >> ${LOG_FILE}
+				echo "Generated LoadID =${LOAD_ID}." >> ${LOG_FILE}
+fi
+}
+
+function WF_SUCCESS_CHECK
+{
+WF_COUNT=`sqlplus -s $DBConnStr_Darwin_STG <<EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+    SELECT count(*) FROM ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+    WHERE WF_NAME='${wf_name}'  
+    AND LOAD_ID=${Load_ID}
+	and SYS_NM='${SYS_NAME}'
+    and LOAD_PROCESS_NM='${PROCESS_NM}'
+    AND UPPER(RUN_STATUS)='SUCCEEDED';
+exit;
+EOF`
+
+RUN_COUNT_EXIT_CD=$?
+
+echo "Workflow count with SUCCEEDED status= ${WF_COUNT}" 
+
+if [[ ${RUN_COUNT_EXIT_CD} -ne 0 ]]
+then
+                echo "\SQL block to get count of workflow from control table with SUCCEEDED status failed to execute. WF_SUCCESS_CHECK function execution failed."  >> ${LOG_FILE}
+                echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${RUN_COUNT_EXIT_CD} ... " >> ${LOG_FILE}
+              ## (echo "DARWIN Load Process:SQL block to get count of workflow from control table with SUCCEEDED status failed to execute on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}:SQL block to get count of workflow from control table with SUCCEEDED status failed to execute." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to get count of workflow from control table with SUCCEEDED status failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to get record count from control table" >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+				
+else 
+                echo -e "\n `date`: SQL block executed successfully to get count of workflow from control table with SUCCEEDED status ..\n" >> ${LOG_FILE}
+				echo "${wf_name} Workflow count with SUCCEEDED status= ${WF_COUNT}." >> ${LOG_FILE}
+fi
+
+}
+
+
+function UPDATE_CNTRL_TBL_RUNNING_INS  
+{
+
+ 	`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+    	set feedback off
+    	set pagesize 0
+    	set head off 
+    	set linesize 1000
+    	whenever oserror exit 9
+    	whenever sqlerror exit sql.sqlcode
+    
+    	UPDATE ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL 
+    	SET RUN_STATUS='RUNNING', 
+    	START_DT_TM=SYSDATE ,
+		END_DT_TM=NULL,
+		LAST_UPDT_DT_TM=NULL
+    	WHERE  RUN_STATUS='FAILED' 
+		and LOAD_ID='${Load_ID}'
+		and WF_NAME='${wf_name}';
+     	COMMIT ;
+exit;
+EOF`
+
+RUN_STATUS=$?	
+if [[ ${RUN_STATUS} -ne 0 ]]
+then
+                echo "\SQL block to Update failed workflow from control table with 'RUNNING' status failed to execute. UPDATE_CNTRL_TBL_RUNNING_INS function execution failed."  >> ${LOG_FILE}
+                echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${RUN_STATUS} ... " >> ${LOG_FILE}
+               ## (echo "DARWIN Load Process:SQL block to Update failed workflow from ETL_PROCESS_CNTRL table with 'RUNNING' status failed to execute on `date`.\n UPDATE_CNTRL_TBL_RUNNING_INS function execution failed. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}:SQL block to Update failed workflow from control table with 'RUNNING' status failed to execute." $EMAIL_LIST
+				export ERROR_MSG="Execution of SQL block to Update 'FAILED' status workflow from control table with 'RUNNING' status failed."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in execution of SQL block to get record count from control table" >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+				
+else 
+                echo -e "\n `date`: SQL block executed successfully to Update failed workflow from control table with 'RUNNING' status ..\n" >> ${LOG_FILE}
+				echo "${wf_name} Workflow STATUS updated to 'RUNNING'." >> ${LOG_FILE}
+fi
+}
+
+
+function archival_process
+{
+find $ARCHIVE_DIR/* -mtime +$days_purge -exec rm -f {} \; 2>/dev/null
+###find $WFLOG_DIR/* -mtime +$days_purge -exec rm -f {} \; 2>/dev/null
+###find $SLOG_DIR/* -mtime +$days_purge -exec rm -f {} \; 2>/dev/null
+
+STATUS=$?	
+if [[ ${STATUS} -ne 0 ]]
+then
+                echo -e "\n Error in archival process.  archival_process function execution failed."  >> ${LOG_FILE}
+                echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${STATUS} ... " >> ${LOG_FILE}
+               ## (echo "DARWIN Load Process: Error in log file archival process on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -s "DARWIN-${PROCESS_NM}@${env}: Error in archival process. " $EMAIL_LIST
+				export ERROR_MSG="Error in archival process."
+				echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+				END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+				echo "END_TM=$END_TM" >> $LOG_FILE
+				FAIL_MAIL_NOTIFICATION
+				rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+				rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+				echo "## Indicator File $SCRIPTS_DIR/${PROCESS_NM}_darwin_process_running.dat and ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv is removed as error in log file archival process." >> $LOG_FILE
+				exit 9; # Terminating the execution of script abnormally
+				
+else 
+              	echo "Log file archival process completed successfully." >> ${LOG_FILE}
+fi
+}
+
+
+function SUCCESS_MAIL_NOTIFICATION
+{
+export SUBJECT_TEXT="DARWIN-${PROCESS_NM}@${env}: Load Process Completed."
+export From_Address=`hostname`
+
+(cat << EOF
+From:$From_Address
+To: ${EMAIL_LIST}
+Subject: ${SUBJECT_TEXT}
+Content-Type: text/html; 
+<html><body>
+<table border=1 width = 1200>
+       <tr><td colspan=2><font color="blue"><center><b> Darwin Load Process</b></center></font> </tr></td>
+       <tr><td><b>SYSTEM NAME</b></td><td> ${SYS_NAME} </td></tr> 
+       <tr><td><b>PROCESS NAME</b></td><td> ${PROCESS_NM} </td></tr> 
+	   <tr><td><b>STATUS</b></td><td><font color="green"> SUCCEEDED </td></tr> 
+       <tr><td><b>LOAD ID</b></td><td> ${Load_ID} </td></tr> 
+       <tr><td><b>PROCESS START DATE TIME</b></td><td> $START_TM </td></tr> 
+       <tr><td><b>PROCESS END DATE TIME</b></td><td> $END_TM </td></tr> 
+</table>
+</body></html> 
+EOF
+) |  /usr/sbin/sendmail -t
+}
+
+
+function FAIL_MAIL_NOTIFICATION
+{
+export SUBJECT_TEXT="DARWIN-${PROCESS_NM}@${env}: Load Process Failed."
+export From_Address=`hostname`
+
+(cat << EOF
+From:$From_Address
+To: ${EMAIL_LIST}
+Subject: ${SUBJECT_TEXT}
+Content-Type: text/html; 
+<html><body>
+<table border=1 width = 1200>
+       <tr><td colspan=2><font color="blue"><center><b> Darwin Load Process</b></center></font> </tr></td>
+       <tr><td><b>SYSTEM NAME</b></td><td> ${SYS_NAME} </td></tr> 
+       <tr><td><b>PROCESS NAME</b></td><td> ${PROCESS_NM} </td></tr> 
+	   <tr><td><b>STATUS</b></td><td><font color="red"> FAILED </td></tr> 
+       <tr><td><b>LOAD ID</b></td><td> ${Load_ID} </td></tr> 
+       <tr><td><b>PROCESS START DATE TIME</b></td><td> $START_TM </td></tr> 
+       <tr><td><b>PROCESS END DATE TIME</b></td><td> $END_TM </td></tr> 
+	   <tr><td><b>ERROR MESSAGE</b></td><td> ${ERROR_MSG}</td></tr>
+       <tr><td><b>PROCESS LOG FILE</b></td><td> ${LOG_FILE_NAME} at $APACHE_LINK</td></tr>
+</table>
+</body></html> 
+EOF
+) |  /usr/sbin/sendmail -t
+}
+
+function  get_min_max_last_run_date
+{
+
+ETL_LAST_RUN_START_DT=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+
+	ALTER SESSION SET NLS_DATE_FORMAT = 'yyyymmdd';
+    select max(START_DT_TM) from ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+    where WF_NAME like 'tf_Comet_ECC_STG_Transactions_Delta_Load%'  
+	and UPPER(RUN_STATUS)='SUCCEEDED';
+  
+exit;
+EOF`
+
+get_status=$?
+if [[ ${get_status} -ne 0 ]]
+then
+        echo "\SQL block to get 'Last run date' from Control table failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${get_status} ... " >> ${LOG_FILE}
+        ##(echo "Execution of SQL block to get 'Last run date' from ETL_PROCESS_CNTRL table failed to execute for workflow= ${wf_name} on `date`. \n Please refer Logfile- ${LOG_FILE} present at link:\n $APACHE_LINK") | mailx -m -s "DARWIN-${PROCESS_NM}@${env}:Execution of SQL block to get 'Last run date' from Control table failed to execute " $EMAIL_LIST
+		export ERROR_MSG="Execution of SQL block to get 'Last run date' from Control table failed."
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		exit 9; # Terminating the execution of script abnormally
+       
+else 
+        echo "\n `date`: SQL block executed successfully to get 'last run date' details from control table for workflow= ${wf_name}." >> ${LOG_FILE}
+	
+fi
+export ETL_LAST_RUN_DT=${ETL_LAST_RUN_START_DT}
+
+
+if [[ -z ${ETL_LAST_RUN_START_DT} ]]; then
+ETL_LAST_RUN_START_DT=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+
+	ALTER SESSION SET NLS_DATE_FORMAT = 'yyyymmdd';
+    select max(START_DT_TM) from ${STG_SCHEMA_NM}.ETL_PROCESS_CNTRL
+    where WF_NAME like 'tf_Comet_ECC_STG_Transactions_Initial_Load%'  
+	and UPPER(RUN_STATUS)='SUCCEEDED';
+  
+exit;
+EOF`
+
+get_status1=$?
+	if [[ ${get_status1} -ne 0 ]]
+	then
+		echo "\SQL block to get Last run date  from Control table for first transaction delta load failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "\SQL block to get 'Last run date' from Control table for first transaction delta load failed to execute. GET_LAST_RUN_DATE function execution failed."  >> ${LOG_FILE}
+		echo "`date '+%m-%d-%Y %H:%M:%S'`: Exit from the script with status ${get_status1} ... " >> ${LOG_FILE}
+        ##(echo "Execution of SQL block to get 'Last run date' from Control table failed to execute for wf_Comet_ECC_STG_Transactions_Initial_Load workflow from ETL_PROCESS_CNTRL table on `date`. \n Please refer Logfile present at link: $APACHE_LINK") | mailx -m -s "DARWIN-${PROCESS_NM}@${env}:Execution of SQL block to get 'Last run date' for first transaction delta load from Control table failed to execute " $EMAIL_LIST
+		export ERROR_MSG="Execution of SQL block to get 'Last run date' for first transaction delta load from Control table failed to execute"
+		echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+		END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+		echo "END_TM=$END_TM" >> $LOG_FILE
+		FAIL_MAIL_NOTIFICATION
+		rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+		rm ${SCRIPT_DIR}/${PROCESS_NM}_Process_load_details.csv
+		exit 9; # Terminating the execution of script abnormally		
+	else 
+		echo "\n `date`: SQL block executed successfully to get last run date details for first transaction delta load from control table." >> ${LOG_FILE}
+			
+	fi
+	export ETL_LAST_RUN_DT=${ETL_LAST_RUN_START_DT}
+fi
+
+}
+
+function  APO_LOAD_SAT_AFTER_2ND_FRIDAY
+{
+export time_cnt=0;
+
+##############################################
+#############################################################################################################
+##### If Process is running for APO_E2E, Check for completion of H2110_PC1_LA_SNP_DD_OW3_R2 job on saturday after 2nd friday.#############
+##############################################################################################################
+sat_after_2nd_friday=`sqlplus -s $DBConnStr_Darwin_STG  << EOF
+    	set feedback off
+    	set pagesize 0
+    	set head off 
+    	set linesize 1000
+    	whenever oserror exit 9
+    	whenever sqlerror exit sql.sqlcode
+        alter session set nls_date_format='YYYY-MM-DD';
+		select NEXT_DAY(trunc(sysdate,'MM') + 6, 'FRI') + 2 from dual;
+exit;
+EOF`
+echo "sat_after_2nd_friday=$sat_after_2nd_friday" >> $LOG_FILE
+
+TODAYS_DATE=`date '+%F'`
+echo "TODAYS_DATE=$TODAYS_DATE" >> $LOG_FILE
+
+	if [[ $sat_after_2nd_friday = $TODAYS_DATE ]]; then 
+		while [ ${time_cnt} -lt 14400 ]
+		do
+			if [ -f ${SCRIPT_DIR}/COMET_APO.ind ]; then
+				echo "`date '+%m-%d-%Y %H:%M:%S'`: COMET_APO.ind found at script directory" >> $LOG_FILE
+				echo "`date '+%m-%d-%Y %H:%M:%S'`: Starting execution of APO_E2E load" >> $LOG_FILE
+				rm ${SCRIPT_DIR}/COMET_APO.ind;
+				break;
+	
+			else
+				echo "`date '+%m-%d-%Y %H:%M:%S'`: COMET_APO.ind not found at script directory.Wait for a min.." >> $LOG_FILE
+				sleep 60;
+				time_cnt=`expr $time_cnt + 60`
+				echo "time_cnt=${time_cnt}" >> $LOG_FILE
+
+				if [[ ${time_cnt} -eq 14400 ]]; then 
+					export ERROR_MSG="Indicator file from SAP job- H2110_PC1_LA_SNP_DD_OW3_R2 NOT found at script directory. Terminating Darwin APO_E2E process. Kindly Check with SAP team."
+					echo "Error Message= $ERROR_MSG" >> $LOG_FILE
+					END_TM=`date '+%A, %B %d, %Y %H:%M:%S %p'`
+					echo "END_TM=$END_TM" >> $LOG_FILE
+					FAIL_MAIL_NOTIFICATION
+					rm $SCRIPT_DIR/${PROCESS_NM}_darwin_process_running.dat
+					exit 9; # Terminating the execution of script abnormally    
+				fi
+				
+			fi
+		done
+	else 
+		echo "Todays is not saturday after secound friday .." >> $LOG_FILE
+	fi
+
+}
+
+################## start function for RFC communcation error #######################
+function get_fail_rfc_wrkflow_list
+{
+
+
+RESULT=`sqlplus -s $DBConnStr << EOF >> $LOG_FILE
+	SET TERMOUT OFF
+	set heading off
+	set trimspool on
+	set trimout on
+	set trims on
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+    spool ${rfc_fail_wf}
+  select  RS.session_id||','||RS.WORKFLOW_ID||','||rs.instance_id||','||RS.SESSION_NAME||','||RS.WORKFLOW_NAME
+        from ${INFA_REP_DB}.REP_SESS_LOG RS,
+        (select max(WORKFLOW_RUN_ID) WORKFLOW_RUN_ID , WORKFLOW_NAME from ${INFA_REP_DB}.REP_SESS_LOG
+        where 
+        UPPER(SUBJECT_AREA) = UPPER('$INFA_FOLDER')
+		and UPPER(WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+        GROUP BY WORKFLOW_NAME) RS1
+        where RS.WORKFLOW_RUN_ID = RS1.WORKFLOW_RUN_ID
+		and RUN_STATUS_CODE != 1
+		and UPPER(RS.WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+		AND (UPPER(FIRST_ERROR_MSG) LIKE '%RFC_COMMUNICATION_FAILURE%' OR UPPER(LAST_ERROR) LIKE '%RFC_COMMUNICATION_FAILURE%');
+	Spool off;
+exit;
+EOF`
+
+}
+
+function get_fail_non_rfc_wrkflow_list
+{
+
+
+RESULT=`sqlplus -s $DBConnStr << EOF >> $LOG_FILE
+	SET TERMOUT OFF
+	set heading off
+	set trimspool on
+	set trimout on
+	set trims on
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+    spool ${non_reover_fail_session}
+  select  RS.session_id||','||RS.WORKFLOW_ID||','||rs.instance_id||','||RS.SESSION_NAME||','||RS.WORKFLOW_NAME||','||'Failed_With_Non-RFC_Communcation_Error'||','||RS.SESSION_LOG_FILE
+  --RS.SESSION_NAME||','||RS.WORKFLOW_NAME ||','||'Failed with a Non-RFC Communcation Error'
+        from ${INFA_REP_DB}.REP_SESS_LOG RS,
+        (select max(WORKFLOW_RUN_ID) WORKFLOW_RUN_ID , WORKFLOW_NAME from ${INFA_REP_DB}.REP_SESS_LOG
+        where 
+        UPPER(SUBJECT_AREA) = UPPER('$INFA_FOLDER')
+		and UPPER(WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+        GROUP BY WORKFLOW_NAME) RS1
+        where RS.WORKFLOW_RUN_ID = RS1.WORKFLOW_RUN_ID
+		and RUN_STATUS_CODE != 1
+		and UPPER(RS.WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+		AND (UPPER(FIRST_ERROR_MSG)  NOT LIKE '%RFC_COMMUNICATION_FAILURE%' OR UPPER(LAST_ERROR) NOT LIKE '%RFC_COMMUNICATION_FAILURE%');
+	Spool off;
+exit;
+EOF`
+
+}
+
+
+function check_non_rfc_failed_session
+{
+for sess_name in `cat ${non_reover_fail_session} `	
+do
+	SESSION_LOG=`echo $sess_name| cut -f7 -d','`  
+    SESSION_NAME=`echo $sess_name| cut -f4 -d','`
+	
+	error=`grep 'RFC_COMMUNICATION_FAILURE' $SESSION_LOG`
+
+if [[ -z ${error} ]]; then
+		echo "NOT RFC COMMUNICATION FAILURE ERROR" >> $LOG_FILE
+		
+else 
+		##Remove from ${non_reover_fail_session}
+		echo "SESSION_NAME= $SESSION_NAME" >> $LOG_FILE
+		sed "/${SESSION_NAME}/ d" ${non_reover_fail_session} > temp1.txt
+		cat temp1.txt > ${non_reover_fail_session}
+		echo "Removed entry for ${SESSION_NAME} from ${non_reover_fail_session}" >> $LOG_FILE
+		##add into ${rfc_fail_wf}
+		echo $sess_name >> $LOG_FILE
+		echo "$sess_name" >> ${rfc_fail_wf}
+		cat ${rfc_fail_wf} >> $LOG_FILE
+		echo "Added entry for ${SESSION_NAME} in ${rfc_fail_wf}" >> $LOG_FILE
+fi
+done
+}
+
+
+function get_failed_session
+{
+echo -e "\n entry of get_failed_session function in main script" >> $LOG_FILE
+for sess_name in `cat ${rfc_fail_wf} `	
+	do
+	  INSTANCE_ID=`echo $sess_name| cut -f3 -d','`  
+	  WORKFLOW_ID=`echo $sess_name| cut -f2 -d','`  
+	  SESSION_ID=`echo $sess_name| cut -f1 -d','`
+	  SESSION_NAME=`echo $sess_name| cut -f4 -d','`
+	  
+	  SESS_NM=`sqlplus -s $DBConnStr << EOF >> $LOG_FILE
+	SET TERMOUT OFF
+	set heading off
+	set trimspool on
+	set trimout on
+	set trims on
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+	spool ${rfc_fail_session} append
+	SELECT WF.TASK_NAME||','|| 
+	CASE WHEN WI.INSTANCE_NAME IS NULL
+	THEN SESS.INSTANCE_NAME
+	ELSE
+	 WI.INSTANCE_NAME||'.'||SESS.INSTANCE_NAME
+	END AS SESS_NM
+	from 
+	(select * from ${INFA_REP_DB}.REP_TASK_INST SESS
+where 
+SESS.TASK_TYPE_NAME='Session' 
+and SESS.INSTANCE_ID=$INSTANCE_ID 
+and SESS.TASK_ID =$SESSION_ID
+)SESS 
+left outer join ${INFA_REP_DB}.REP_TASK_INST WI
+on SESS.WORKFLOW_ID = WI.TASK_ID
+inner join  ${INFA_REP_DB}.REP_ALL_TASKS WF
+on ((SESS.WORKFLOW_ID=WF.TASK_ID or WI.WORKFLOW_ID=WF.TASK_ID)
+AND WF.TASK_TYPE_NAME = 'Workflow')
+WHERE (SESS.WORKFLOW_ID=$WORKFLOW_ID OR WI.WORKFLOW_ID=$WORKFLOW_ID);
+Spool off;
+exit;
+EOF`
+
+done
+}
+
+function run_failed_session
+{
+echo -e "\n entry of run_failed_session function in main script" >> $LOG_FILE
+for sess_name in `cat ${rfc_fail_session}`	
+	do
+
+	  SESS_NM=`echo $sess_name| cut -f2 -d','`
+	  echo "SESSION_NAME=$SESS_NM" >> $LOG_FILE
+	  
+#$PM_HOME/pmcmd starttask -sv $INFA_SERVICE -d $INFA_DOMAIN -u $INFA_USER -p $INFA_PSWD -f $INFA_FOLDER -w $INFA_WRKFLOW -paramfile ${PARAM_DIR}/$INFA_WRKFLOW.prm -wait $SESS_NM		
+scriptPath=${0}
+scriptName=$(basename "$scriptPath")
+taskName=${SESS_NM}
+scriptName="${scriptName%.*}"
+icUser=iics_darwin@merck.bk.prod.com
+icPwd=*********
+icHdr1="Accept: application/xml";
+icHdr2="Content-Type:  application/xml";
+file_icResponse_xml=${LOG_DIR}/icsresponse_xml_${taskName}.xml
+file_icResponse_json=${LOG_DIR}/icsresponse_json_${taskName}.json
+file_logFile=${LOG_DIR}/icslogfile_${taskName}.xml
+chmod 777 $file_logFile
+icLoginUrl=https://dm-us.informaticacloud.com/ma/api/v2;
+icServerUrl=${icLoginUrl};
+alias timeStamp="date '+%T'";
+###taskName=${SESS_NM}
+taskType="MTT";
+ 
+ 
+function ic_parseXml(){
+ 
+ 
+    if  ! [ "$1" ] || ! [ "$2" ]; then
+        echo "usage: $me <XML file> <XML tag>"
+    elif ! [ -f $1 ]; then
+        echo "Error: $1 not found!"
+    else
+       cat $1 | grep -oP "(?<=<$2>)[^<]+"| head -1
+    fi
+}
+ 
+ 
+function aux_logMe(){
+    echo -e "${1}" 2>&1 | tee -a ${file_logFile};
+}
+ 
+ 
+function ic_login(){
+ 
+aux_logMe
+aux_logMe "$(timeStamp): Login to Informatica Cloud";
+ 
+    curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -k -X POST -o ${file_icResponse_xml} -d "<login> <username>${icUser}</username> <password>${icPwd}</password></login>" "${icLoginUrl}/user/login" > /dev/null;
+          chmod 777 $file_icResponse_xml
+      chmod 777 $file_logFile
+      icSessId="$(ic_parseXml ${file_icResponse_xml} icSessionId)";
+          icServerUrl="$(ic_parseXml ${file_icResponse_xml} serverUrl)";
+              echo "file read starts here"
+            cat ${file_icResponse_xml};
+            echo "file read ends here"
+   }
+ 
+ 
+ 
+function ic_startTaskFlow(){
+ 
+
+in_taskName=${START_SESS_NM}
+file_icResponse_xml=${LOG_DIR}/${in_taskName}.xml;
+curl -s -0 -H 'Accept: application/xml' -H 'Content-Type:  application/xml' -H "IDS-SESSION-ID: ${icSessId}" -X POST -o ${file_icResponse_xml} -d "<job> <taskName>${in_taskName}</taskName> <taskType>${taskType}</taskType></job>" "${icServerUrl}/api/v2/job" > /dev/null;
+ 
+    chmod 777 $file_icResponse_xml    
+        errCd="$(ic_parseXml ${file_icResponse_xml} code)";
+ 
+ 
+        if [ -z ${errCd} ]; then
+ 
+ 
+                #retrieve the task id and run id from taskXml
+            echo "file read starts here"
+            cat ${file_icResponse_xml};
+            echo "file read ends here"
+                mttrid="$(ic_parseXml ${file_icResponse_xml} runId)";
+				mttid="$(ic_parseXml ${file_icResponse_xml} taskId)";
+        aux_logMe "$(timeStamp): ${taskName} started successfully" 
+                aux_logMe "$(timeStamp): mttrid : $mttrid"
+				aux_logMe "$(timeStamp): mttid : $mttid"
+ 
+        else
+            aux_logMe "$(timeStamp): Identified issues with triggering ${taskName}"
+            aux_logMe "$(timeStamp): Issue  $(ic_parseXml ${file_icResponse_xml} description)"
+            aux_logMe "$(timeStamp): Exiting script"
+            aux_logMe "------------------------------------------------------------"            
+            ic_logout > /dev/null;
+            exit 1            
+        fi    
+ 
+#activity_monitor ${in_taskName}
+}
+ 
+ 
+function ic_activity_monitor(){
+state="";
+status="RUNNING";
+i=0;
+while [ -z ${state} ]
+do
+        curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -H "icSessionId: ${icSessId}" -k -X GET -o ${file_icResponse_json} "https://na2.dm-us.informaticacloud.com/saas/api/v2/activity/activityLog?taskId=${mttid}&runId=${mttrid}" > /dev/null;
+       chmod 777 $file_icResponse_json 
+		cat $file_icResponse_json
+       echo "in while loop"
+        i=i+1;
+        echo "value of i is $i"
+        sleep 50
+        #status=$(grep -o '"status": *"[^"]*"' $file_icResponse_json | cut -d'"' -f4 | head -1)
+        state="$(ic_parseXml ${file_icResponse_json} state)";
+		echo "Value of status is ${status}";
+        echo "$(timeStamp): waiting for ${taskName} to complete, sleep for 50 seconds"
+        rm $file_icResponse_json 
+done
+             if [ "${state}" == "1" ];then
+            aux_logMe "$(timeStamp): ${taskName} exit state is successful" 
+            aux_logMe "$(timeStamp): ${taskName} is completed";
+			elif [ "${state}" == "2" ];then
+            aux_logMe "$(timeStamp): ${taskName} exit state is completed with errors" 
+            aux_logMe "$(timeStamp): ${taskName} is completed";
+			#exit 0            
+			else
+            aux_logMe "$(timeStamp): ${taskName} exit status is failed to complete" 
+            aux_logMe "$(timeStamp): Issues detected with task ${taskName}, hence exiting from script";
+            aux_logMe "---------"
+            ic_logout;
+            exit 1
+           fi
+}
+ 
+function ic_logout(){
+             aux_logMe "$(timeStamp): Logging out of Informatica Cloud...";
+             curl -s -0 -H "${icHdr1}" -H "${icHdr2}" -H "icSessionId: ${icSessId}" -k -X POST "${icServerUrl}/api/v2/user/logout" 2>&1
+             aux_logMe "logout return code: ${?}";
+             aux_logMe "$(timeStamp): Successfully logged out of Informatica Cloud.";
+     }
+ic_login
+ic_startTaskFlow
+ic_activity_monitor
+ic_logout
+SESS_NM1=`echo $SESS_NM| cut -f2 -d'.'`
+sess_stat1=`sqlplus -s $DBConnStr << EOF
+	SET TERMOUT OFF
+	set heading off
+	set trimspool on
+	set trimout on
+	set trims on
+	set feedback off
+	set pagesize 0
+	set head off 
+	set linesize 1000
+	whenever oserror exit 9
+	whenever sqlerror exit sql.sqlcode
+	SELECT  RUN_STATUS_CODE
+FROM ${INFA_REP_DB}.REP_SESS_LOG RS,
+(SELECT MAX(WORKFLOW_RUN_ID) WORKFLOW_RUN_ID , WORKFLOW_NAME FROM ${INFA_REP_DB}.REP_SESS_LOG
+WHERE 
+UPPER(SUBJECT_AREA) = UPPER('$INFA_FOLDER')
+AND UPPER(WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+AND UPPER(SESSION_NAME) =UPPER('$SESS_NM1')
+GROUP BY WORKFLOW_NAME) RS1
+WHERE RS.WORKFLOW_RUN_ID = RS1.WORKFLOW_RUN_ID
+AND UPPER(RS.WORKFLOW_NAME)=UPPER('$INFA_WRKFLOW')
+AND UPPER(SESSION_NAME) =UPPER('$SESS_NM1')
+;
+
+exit;
+EOF`
+
+
+sess_stat=`echo $sess_stat1|sed -e 's/^[ \t]*//'`
+echo -e "\n status of $SESS_NM :$sess_stat1 & $sess_stat" >> $LOG_FILE 
+
+if [[ ${sess_stat} -ne 1 ]] ; then
+            echo "Failure occured during $SESS_NM execution" >> $LOG_FILE
+			##echo "${SESS_NM}, ${WRKFLW_NM}, Not recovred for RFC Communcation Error" >> ${non_reover_fail_session}
+			echo "${SESS_NM}, ${WRKFLW_NM}, Not recovred for RFC Communcation Error" >> ${non_reover_fail_session}
+			##RS.session_id||','||RS.WORKFLOW_ID||','||rs.instance_id||','||RS.SESSION_NAME||','||RS.WORKFLOW_NAME||','||'Failed with a Non-RFC Communcation Error'||','||RS.SESSION_LOG_FILE
+fi
+done
+
+if [[ -s ${non_reover_fail_session} ]]; then
+		echo "Below sessions are failed:" >> $LOG_FILE
+		cat ${non_reover_fail_session} >> $LOG_FILE
+		(echo "Execution of sessions from attached  file are failed on `date`.") | mailx -a ${non_reover_fail_session} -s "DARWIN-${PROCESS_NM}@${env}:Execution of sessions from attached  file are failed " $EMAIL_LIST
+		export RUN_STATUS="FAILED";
+		UPDATE_CNTRL_TBL_RUNNING   >> $LOG_FILE
+		workflow_failure_mail
+else 
+		echo  " $wf_name WORKFLOW Load SUCCEEDED,`date`" >> $LOG_FILE
+		export RUN_STATUS="SUCCEEDED";
+    	UPDATE_CNTRL_TBL_FAILED
+fi
+}
+
+####################################################
+### Trigger the Notification E-Mail
+####################################################
+function Trigger_E_Mail
+{
+
+export DARWIN_ETL_TEAM="darwin_etl_ops@merck.com,darwin_etl_offshor@merck.com"
+
+E_Mail_Subject=$1
+E_Mail_Body=$2
+E_Mail_Atchmnt=$3
+E_Mail_To_List=$4/
+
+if [ -z "${E_Mail_To_List}" ]; then
+E_Mail_To_List="${DARWIN_ETL_TEAM}"
+fi
+	    
+if [ -z "${E_Mail_Atchmnt}" ]; then
+echo -e  "${E_Mail_Body}" | mail -r drwinetlu@merck.com -s "${E_Mail_Subject}" "${E_Mail_To_List}"
+else
+E_Mail_Atchmnt=`echo "${E_Mail_Atchmnt}" | sed 's/,/ -a /g'`
+echo -e "${E_Mail_Body}" | mail -r drwinetlu@merck.com -a ${E_Mail_Atchmnt} -s "${E_Mail_Subject}" "${E_Mail_To_List}"
+fi
+
+}
+
+#############################################################################################################################################################
+#SendEmail fucntion is used to send Success/Failure email---QLIK
+#############################################################################################################################################################
+function SendEmail
+{
+E_Mail_Subject=$1
+E_Mail_Body=$2
+E_Mail_To_List=$3
+E_Mail_Atchmnt=$4
+
+if [ -z "${E_Mail_To_List}" ]; then
+E_Mail_To_List="${DARWIN_ETL_TEAM}"
+fi
+	    
+if [ -z "${E_Mail_Atchmnt}" ]; then
+echo -e  "${E_Mail_Body}" | mail -r noreply@DARWIN_PRD.MERCK.COM -s "${E_Mail_Subject}" "${E_Mail_To_List}"
+else
+E_Mail_Atchmnt=`echo "${E_Mail_Atchmnt}" | sed 's/,/ -a /g'`
+echo -e "${E_Mail_Body}" | mail -r noreply@DARWIN_PRD.MERCK.COM -a ${E_Mail_Atchmnt} -s "${E_Mail_Subject}" "${E_Mail_To_List}"
+fi
+
+}
+
+
+################## end function for RFC communcation error #######################
+
+
+################## end function for RFC communcation error #######################
+
+echo "function.Profile file set"
